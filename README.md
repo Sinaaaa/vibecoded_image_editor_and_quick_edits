@@ -63,6 +63,7 @@ Designed for speed, minimal UI clutter, and quick edits — perfect for browsing
 ---
 
 ## 📦 Dependencies
+Disclaimer: I only tested on Arch BTW.
 
 ### Arch Derivatives
 ```bash
