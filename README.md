@@ -1,6 +1,6 @@
 # Why do this?
 I tried pretty much all the well known image viewers on Linux & did not really like either of them. Viewnior is ok, but it's still too clunky to do quick edits (crop, rotation) & it doesn't work right on Wayland.
-Also many of them are straight up laggy (hello there Gwenview, I don't like you). This applet feels snappy to use, it will always react to left-right arrow keys/spamming no matter how large the images you are browsing are, or at least it should.. Even the fastest computer needs time to load a 100mpx image from a spinning HDD, this vibe coded python monster handles this quite gracefully. Furthermore the app does caching, so if you open an image it will cache the next few in the background, so most of the time in typical use you will not notice any loading time. 
+Also many of them are straight up laggy (hello there Gwenview, I don't like you). This applet feels snappy to use, it will always react to left-right arrow keys/spamming no matter how large the images you are browsing are, or at least it should.. Even the fastest computer needs time to load a 100mpx image from a spinning HDD, this vibe coded python monster handles this quite gracefully. Furthermore the app does caching, so if you open an image it will cache the next few in the background, so most of the time in typical use you will not notice any loading time or lag.
 
 
 ![VibeCoded Image Viewer Screenshot](screenshot.jpg)
