@@ -1,3 +1,4 @@
+![VibeCoded Image Viewer Screenshot](screenshot.jpg)
 # 🖼️ vibecoded_image_editor_and_quick_edits LLM Generated Usage Guide
 
 A lightweight, keyboard‑driven image viewer built with Python, PyQt6, and Pillow.  
