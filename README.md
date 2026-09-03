@@ -80,16 +80,6 @@ sudo pacman -S python python-pillow python-pyqt6
 sudo apt install python3 python3-pil python3-pyqt6
 ```
 
-### macOS (Homebrew)
-```bash
-brew install python
-pip install pillow pyqt6
-```
-
-### Windows (pip)
-```bash
-pip install pillow pyqt6
-```
 
 > 💡 You also need `gio` for the trash feature (pre‑installed on GNOME/GTK desktops).  
 > On non‑GNOME systems, you can replace `gio trash` with `trash-cli` or `rm` by editing the `trash_current_image` method.
