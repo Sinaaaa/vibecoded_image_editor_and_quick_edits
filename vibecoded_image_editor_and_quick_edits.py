@@ -1,8 +1,6 @@
 #sudo pacman -S python python-pillow python-pyqt6 
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-#sudo pacman -S python python-pillow python-pyqt6 
-#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 import os
 import random
