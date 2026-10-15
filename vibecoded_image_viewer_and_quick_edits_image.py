@@ -1,11 +1,14 @@
 #sudo pacman -S python python-pillow python-pyqt6 
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+#sudo pacman -S python python-pillow python-pyqt6 
+#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 import os
 import random
 import subprocess
 import sys
+import time
 from collections import deque
 
 from PIL import Image, UnidentifiedImageError
@@ -18,6 +21,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -40,7 +44,11 @@ BTN_TEXT_INFO = "💬" #💬ⓘ𝕚 are not bad
 BTN_TEXT_MINIFY = "→←"
 BTN_TEXT_EXIT = "✕"
 
-SLIDESHOW_INTERVAL_MS = 5500
+SLIDESHOW_INTERVAL_MS = 5500   # default; right-click the slideshow button for others
+SLIDESHOW_PRESETS_MS = [1000, 2000, 3000, 4000, 5500, 8000, 10000, 15000,
+                        30000, 60000, 120000, 300000]
+
+HINT_DELAY_MS = 1000           # hover time before a button's description shows in the OSD
 
 UI_FONT_SIZE = "16px"
 BTN_WIDTH = 36
@@ -53,8 +61,16 @@ SLIDER_HOVER_COLOR = "#BFBFBF"
 class MainImageWorker(QObject):
     finished = pyqtSignal(int, QImage, object, str)
 
+    def __init__(self):
+        super().__init__()
+        # Written by the GUI thread, read here. If the user has already moved on,
+        # a queued request is skipped instead of being decoded for nothing.
+        self.latest_request_id = 0
+
     @pyqtSlot(int, str, float)
     def process_image(self, request_id, image_path, rotation_angle):
+        if request_id != self.latest_request_id:
+            return
         try:
             with Image.open(image_path) as img:
                 img.load()
@@ -110,6 +126,73 @@ class CacheWorker(QObject):
             pass
 
 
+class HoverHintController(QObject):
+    """Shows a button's description in the OSD after the cursor rests on it.
+
+    One shared QTimer; the buttons report enter/leave through their own virtual
+    methods, so no Python runs for unrelated events.
+    """
+
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self._viewer = viewer
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._show)
+        self._target = None
+        self._shown_text = None
+
+    def hover(self, button):
+        self._target = button
+        self._timer.start(HINT_DELAY_MS)
+
+    def cancel(self):
+        self._timer.stop()
+        self._target = None
+        # only remove the OSD if it is still our hint, not a message from an action
+        osd = self._viewer.osd_label
+        if self._shown_text is not None and osd.isVisible() and osd.text() == self._shown_text:
+            self._viewer.hide_osd()
+        self._shown_text = None
+
+    def _show(self):
+        button = self._target
+        if button is None or not button.isVisible():
+            return
+        self._shown_text = button.tip_text()
+        self._viewer.show_osd(self._shown_text, duration=6000)
+
+
+class TipButton(QPushButton):
+    def __init__(self, text, tip, controller, parent=None):
+        super().__init__(text, parent)
+        self._tip = tip
+        self._controller = controller
+
+    def tip_text(self):
+        return self._tip
+
+    def set_tip(self, tip):
+        self._tip = tip
+
+    def enterEvent(self, event):
+        self._controller.hover(self)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._controller.cancel()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._controller.cancel()
+        super().mousePressEvent(event)
+
+    def hideEvent(self, event):
+        # the bar disappears in fullscreen without a leave event
+        self._controller.cancel()
+        super().hideEvent(event)
+
+
 class ImageCanvas(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -145,8 +228,13 @@ class ImageCanvas(QLabel):
                 )
         elif self.is_selecting:
             current_pos = event.position().toPoint()
-            self.selection_rect = QRect(self.selection_start_pos, current_pos).normalized()
-            self.update()
+            self.set_selection_rect(QRect(self.selection_start_pos, current_pos).normalized())
+
+    def set_selection_rect(self, new_rect):
+        # repaint only the area the rubber band touched, not the whole canvas
+        old_rect = self.selection_rect
+        self.selection_rect = new_rect
+        self.update(old_rect.united(new_rect).adjusted(-3, -3, 3, 3))
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -155,8 +243,7 @@ class ImageCanvas(QLabel):
         elif event.button() == Qt.MouseButton.RightButton:
             self.is_selecting = False
             current_pos = event.position().toPoint()
-            self.selection_rect = QRect(self.selection_start_pos, current_pos).normalized()
-            self.update()
+            self.set_selection_rect(QRect(self.selection_start_pos, current_pos).normalized())
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -198,7 +285,7 @@ class ImageViewer(QMainWindow):
         self.current_index = -1
         
         self.current_pil_image = None
-        self.base_pixmap = None
+        self.base_image = None
         self.original_save_kwargs = {}
 
         self.image_cache = {}
@@ -211,6 +298,8 @@ class ImageViewer(QMainWindow):
         self.zoom_factor = 1.0
         self.is_custom_zoom = False
 
+        self.slideshow_interval_ms = SLIDESHOW_INTERVAL_MS
+
         self.request_counter = 0
 
         self.load_timer = QTimer(self)
@@ -222,7 +311,7 @@ class ImageViewer(QMainWindow):
         self.idle_cache_timer.timeout.connect(self.process_next_idle_cache)
 
         self.slideshow_timer = QTimer(self)
-        self.slideshow_timer.setInterval(SLIDESHOW_INTERVAL_MS)
+        self.slideshow_timer.setInterval(self.slideshow_interval_ms)
         self.slideshow_timer.timeout.connect(self.show_random_image)
 
         self.smooth_zoom_timer = QTimer(self)
@@ -254,12 +343,12 @@ class ImageViewer(QMainWindow):
             is_now_fullscreen = self.isFullScreen()
             if is_now_fullscreen != self._was_fullscreen:
                 self._was_fullscreen = is_now_fullscreen
+                # get_stylesheet() ignores its `fullscreen` argument, so re-applying it
+                # here only forced a full re-polish of every widget for no visual change.
                 if is_now_fullscreen:
                     self.controls_wrapper.hide()
-                    self.setStyleSheet(self.get_stylesheet(fullscreen=True))
                 else:
                     self.controls_wrapper.show()
-                    self.setStyleSheet(self.get_stylesheet(fullscreen=False))
                 QTimer.singleShot(50, self.reset_to_fit_screen)
                 QTimer.singleShot(50, self.reposition_osd)
                 QTimer.singleShot(150, self.reposition_osd)
@@ -335,13 +424,14 @@ class ImageViewer(QMainWindow):
         wrapper_layout.addWidget(self.controls_widget)
         wrapper_layout.addStretch()
 
+        self.tips = HoverHintController(self)
         self.buttons = []
 
-        self.btn_open = QPushButton(BTN_TEXT_OPEN)
+        self.btn_open = TipButton(BTN_TEXT_OPEN, "Open image", self.tips)
         self.btn_open.clicked.connect(self.open_file_dialog)
         self.buttons.append(self.btn_open)
 
-        self.btn_prev = QPushButton(BTN_TEXT_PREV)
+        self.btn_prev = TipButton(BTN_TEXT_PREV, "Previous image  (←)", self.tips)
         self.btn_prev.setAutoRepeat(True)
         self.btn_prev.setAutoRepeatDelay(300)
         self.btn_prev.setAutoRepeatInterval(100)
@@ -349,7 +439,7 @@ class ImageViewer(QMainWindow):
         self.btn_prev.setEnabled(False)
         self.buttons.append(self.btn_prev)
 
-        self.btn_next = QPushButton(BTN_TEXT_NEXT)
+        self.btn_next = TipButton(BTN_TEXT_NEXT, "Next image  (→)", self.tips)
         self.btn_next.setAutoRepeat(True)
         self.btn_next.setAutoRepeatDelay(300)
         self.btn_next.setAutoRepeatInterval(100)
@@ -357,51 +447,54 @@ class ImageViewer(QMainWindow):
         self.btn_next.setEnabled(False)
         self.buttons.append(self.btn_next)
 
-        self.btn_rotate_left = QPushButton(BTN_TEXT_ROTATE_LEFT)
+        self.btn_rotate_left = TipButton(BTN_TEXT_ROTATE_LEFT, "Rotate left  (L)", self.tips)
         self.btn_rotate_left.clicked.connect(self.rotate_left)
         self.btn_rotate_left.setEnabled(False)
         self.buttons.append(self.btn_rotate_left)
 
-        self.btn_rotate_right = QPushButton(BTN_TEXT_ROTATE_RIGHT)
+        self.btn_rotate_right = TipButton(BTN_TEXT_ROTATE_RIGHT, "Rotate right  (R)", self.tips)
         self.btn_rotate_right.clicked.connect(self.rotate_right)
         self.btn_rotate_right.setEnabled(False)
         self.buttons.append(self.btn_rotate_right)
 
-        self.btn_crop = QPushButton(BTN_TEXT_CROP)
+        self.btn_crop = TipButton(BTN_TEXT_CROP, "Crop to selection  (C)  ·  right-drag to select", self.tips)
         self.btn_crop.clicked.connect(self.crop_selection)
         self.btn_crop.setEnabled(False)
         self.buttons.append(self.btn_crop)
 
-        self.btn_reset_crop = QPushButton(BTN_TEXT_RESET_CROP)
+        self.btn_reset_crop = TipButton(BTN_TEXT_RESET_CROP, "Reset / discard changes  (Space)", self.tips)
         self.btn_reset_crop.clicked.connect(self.reset_crop_or_selection)
         self.btn_reset_crop.setEnabled(False)
         self.buttons.append(self.btn_reset_crop)
 
-        self.btn_save = QPushButton(BTN_TEXT_SAVE)
+        self.btn_save = TipButton(BTN_TEXT_SAVE, "Save over original  (S)", self.tips)
         self.btn_save.clicked.connect(self.save_image)
         self.btn_save.setEnabled(False)
         self.buttons.append(self.btn_save)
         
-        self.btn_fullscreen = QPushButton(BTN_TEXT_FULLSCREEN)
+        self.btn_fullscreen = TipButton(BTN_TEXT_FULLSCREEN, "Fullscreen  (Enter / middle-click)", self.tips)
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         self.buttons.append(self.btn_fullscreen)
 
-        self.btn_slideshow = QPushButton(BTN_TEXT_SLIDESHOW)
+        self.btn_slideshow = TipButton(BTN_TEXT_SLIDESHOW, "Random slideshow  ·  right-click to set the interval", self.tips)
         self.btn_slideshow.clicked.connect(self.toggle_slideshow)
         self.btn_slideshow.setEnabled(False)
+        self.btn_slideshow.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_slideshow.customContextMenuRequested.connect(self.show_slideshow_menu)
         self.buttons.append(self.btn_slideshow)
+        self.refresh_slideshow_tip()
 
-        self.btn_info = QPushButton(BTN_TEXT_INFO)
+        self.btn_info = TipButton(BTN_TEXT_INFO, "Image info  (I)", self.tips)
         self.btn_info.clicked.connect(self.show_image_info)
         self.btn_info.setEnabled(False)
         self.buttons.append(self.btn_info)
 
-        self.btn_minify = QPushButton(BTN_TEXT_MINIFY)
+        self.btn_minify = TipButton(BTN_TEXT_MINIFY, "Shrink to 1920 px on the long edge  (M)", self.tips)
         self.btn_minify.clicked.connect(self.minify_image)
         self.btn_minify.setEnabled(False)
         self.buttons.append(self.btn_minify)
 
-        self.btn_exit = QPushButton(BTN_TEXT_EXIT)
+        self.btn_exit = TipButton(BTN_TEXT_EXIT, "Quit", self.tips)
         self.btn_exit.clicked.connect(self.close)
         self.buttons.append(self.btn_exit)
 
@@ -472,6 +565,20 @@ class ImageViewer(QMainWindow):
                 color: #b0b0b0;
                 background-color: {bg_color};
                 border: none;
+            }}
+            QMenu {{
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                border: 1px solid #3a3a3a;
+                padding: 4px 0px;
+            }}
+            QMenu::item {{
+                background-color: transparent;
+                padding: 6px 24px 6px 14px;
+            }}
+            QMenu::item:selected {{
+                background-color: #005999;
+                color: #ffffff;
             }}
             QProgressBar {{
                 background-color: transparent;
@@ -563,6 +670,9 @@ class ImageViewer(QMainWindow):
                 self.toggle_fullscreen()
                 return True
         elif event.type() == QEvent.Type.KeyPress:
+            # let menus and modal dialogs (file dialog etc.) have their own keys
+            if QApplication.activePopupWidget() is not None or QApplication.activeModalWidget() is not None:
+                return False
             if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
                 if event.key() == Qt.Key.Key_Left:
                     self.show_previous_image()
@@ -673,6 +783,41 @@ class ImageViewer(QMainWindow):
             self.update_button_states()
             self.show_random_image()
 
+    @staticmethod
+    def format_interval(ms):
+        if ms >= 60000 and ms % 60000 == 0:
+            return f"{ms // 60000} min"
+        return f"{ms / 1000:g} s"
+
+    def refresh_slideshow_tip(self):
+        self.btn_slideshow.set_tip(
+            f"Random slideshow, {self.format_interval(self.slideshow_interval_ms)} per image"
+            "  ·  right-click to change"
+        )
+
+    def show_slideshow_menu(self, _pos):
+        self.tips.cancel()
+        menu = QMenu(self.btn_slideshow)
+        values = sorted(set(SLIDESHOW_PRESETS_MS) | {self.slideshow_interval_ms})
+        for ms in values:
+            label = self.format_interval(ms)
+            if ms == SLIDESHOW_INTERVAL_MS:
+                label += "  (default)"
+            marker = "✓  " if ms == self.slideshow_interval_ms else "     "
+            action = menu.addAction(marker + label)
+            action.triggered.connect(lambda _checked=False, v=ms: self.set_slideshow_interval(v))
+
+        # open upwards from the button, because the bar sits at the bottom of the window
+        menu.ensurePolished()
+        origin = self.btn_slideshow.mapToGlobal(QPoint(0, 0))
+        menu.exec(QPoint(origin.x(), origin.y() - menu.sizeHint().height()))
+
+    def set_slideshow_interval(self, ms):
+        self.slideshow_interval_ms = ms
+        self.slideshow_timer.setInterval(ms)   # on a running timer this restarts the countdown
+        self.refresh_slideshow_tip()
+        self.show_osd(f"Slideshow interval: {self.format_interval(ms)}", duration=1000)
+
     def update_button_states(self):
         has_images = len(self.image_files) > 0 and 0 <= self.current_index < len(self.image_files)
         is_slideshow = self.slideshow_timer.isActive()
@@ -762,7 +907,7 @@ class ImageViewer(QMainWindow):
             QImage.Format.Format_RGBA8888
         ).copy()
 
-        self.base_pixmap = QPixmap.fromImage(qimage)
+        self.base_image = qimage
         self.update_image_display(smooth=True)
         self.show_osd("image Minified to 1080p", duration=1500)
 
@@ -836,7 +981,7 @@ class ImageViewer(QMainWindow):
             self.zoom_factor = 1.0
             self.is_custom_zoom = False
             self.image_label.clear_selection()
-            self.base_pixmap = None
+            self.base_image = None
             self.current_pil_image = None
             self.original_save_kwargs = {}
 
@@ -863,13 +1008,16 @@ class ImageViewer(QMainWindow):
         self.is_custom_zoom = False
         self.rotation_angle = 0
         self.image_label.clear_selection()
-        self.base_pixmap = None
+        self.base_image = None
         self.current_pil_image = None
         self.original_save_kwargs = {}
 
         self.update_button_states()
-        
-        self.load_timer.start(75)
+
+        # 75 ms debounce protects the decoder when skipping through uncached files;
+        # an already cached image doesn't need to wait for it.
+        path = self.image_files[self.current_index]
+        self.load_timer.start(0 if path in self.image_cache else 75)
 
     def schedule_idle_cache(self):
         if self.slideshow_timer.isActive():
@@ -921,10 +1069,14 @@ class ImageViewer(QMainWindow):
             if self.rotation_angle == 0 and image_path in self.image_cache:
                 qimage, pil_img = self.image_cache[image_path]
                 self.request_counter += 1
-                self.on_image_processed(self.request_counter, qimage, pil_img.copy(), "")
+                self.main_worker.latest_request_id = self.request_counter
+                # no pil_img.copy(): every edit (crop/minify/rotate) builds a new image
+                # and never mutates this one, so sharing it with the cache is safe
+                self.on_image_processed(self.request_counter, qimage, pil_img, "")
                 return
 
             self.request_counter += 1
+            self.main_worker.latest_request_id = self.request_counter
             
             self.current_progress_value = 0
             self.progress_bar.setValue(0)
@@ -957,16 +1109,17 @@ class ImageViewer(QMainWindow):
 
         if error_msg:
             self.current_pil_image = None
-            self.base_pixmap = None
+            self.base_image = None
             self.image_label.clear()
             self.image_label.setText(f"Corrupted or invalid image file:\n{os.path.basename(image_path)}\n{error_msg}")
+            self.update_image_display()
             
             self.update_button_states()
 
             self.setWindowTitle(f"Image Viewer - [Corrupted] {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
         else:
             self.current_pil_image = pil_img
-            self.base_pixmap = QPixmap.fromImage(qimage)
+            self.base_image = qimage
             self.setWindowTitle(f"Image Viewer - {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
             
             self.update_button_states()
@@ -975,37 +1128,42 @@ class ImageViewer(QMainWindow):
             self.schedule_idle_cache()
 
     def update_image_display(self, smooth=True):
-        if not self.base_pixmap or self.base_pixmap.isNull():
+        if not self.base_image or self.base_image.isNull():
+            # placeholder / error text: let the label fill the viewport so the
+            # centered text is never clipped to a stale, too-small label size
+            self.image_label.resize(self.scroll_area.viewport().size())
             return
 
+        # base_image is a QImage: scaling it directly avoids converting the full-size
+        # picture into a QPixmap (a big copy on the GUI thread) on every image change.
         transform_mode = Qt.TransformationMode.SmoothTransformation if smooth else Qt.TransformationMode.FastTransformation
         viewport_size = self.scroll_area.viewport().size()
 
         if not self.is_custom_zoom:
-            scaled_pixmap = self.base_pixmap.scaled(
+            scaled_pixmap = self.base_image.scaled(
                 viewport_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 transform_mode
             )
             self.image_label.resize(viewport_size)
         else:
-            target_w = int(self.base_pixmap.width() * self.zoom_factor)
-            target_h = int(self.base_pixmap.height() * self.zoom_factor)
+            target_w = int(self.base_image.width() * self.zoom_factor)
+            target_h = int(self.base_image.height() * self.zoom_factor)
             
             if target_w > 0 and target_h > 0:
-                scaled_pixmap = self.base_pixmap.scaled(
+                scaled_pixmap = self.base_image.scaled(
                     target_w, target_h,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     transform_mode
                 )
             else:
-                scaled_pixmap = self.base_pixmap
+                scaled_pixmap = self.base_image
 
             label_w = max(viewport_size.width(), scaled_pixmap.width())
             label_h = max(viewport_size.height(), scaled_pixmap.height())
             self.image_label.resize(label_w, label_h)
 
-        self.image_label.setPixmap(scaled_pixmap)
+        self.image_label.setPixmap(QPixmap.fromImage(scaled_pixmap))
 
     def crop_selection(self):
         if self.slideshow_timer.isActive():
@@ -1062,7 +1220,7 @@ class ImageViewer(QMainWindow):
             QImage.Format.Format_RGBA8888
         ).copy()
 
-        self.base_pixmap = QPixmap.fromImage(qimage)
+        self.base_image = qimage
         self.update_image_display(smooth=True)
         self.show_osd("Cropped in memory (Click Save to write)", duration=1500)
 
@@ -1114,7 +1272,7 @@ class ImageViewer(QMainWindow):
                 save_img = save_img.convert("RGB")
 
         try:
-            self.base_pixmap = None
+            self.base_image = None
             
             ext = os.path.splitext(current_path)[1]
             temp_path = current_path + ".tmp_save" + ext
@@ -1149,7 +1307,7 @@ class ImageViewer(QMainWindow):
         image_path = self.image_files[self.current_index]
         
         try:
-            self.base_pixmap = None
+            self.base_image = None
             self.current_pil_image = None
             
             if image_path in self.image_cache:
@@ -1170,6 +1328,7 @@ class ImageViewer(QMainWindow):
                 self.current_index = -1
                 self.image_label.clear()
                 self.image_label.setText("Open an image to start")
+                self.update_image_display()
                 self.setWindowTitle("Image Viewer")
                 self.update_button_states()
             else:
@@ -1217,7 +1376,7 @@ class ImageViewer(QMainWindow):
             self.trigger_navigation()
 
     def handle_wheel_zoom(self, event):
-        if not self.base_pixmap or self.base_pixmap.isNull():
+        if not self.base_image or self.base_image.isNull():
             return
 
         angle_delta = event.angleDelta().y()
@@ -1228,15 +1387,15 @@ class ImageViewer(QMainWindow):
         if not self.is_custom_zoom:
             self.is_custom_zoom = True
             current_pixmap = self.image_label.pixmap()
-            if current_pixmap and self.base_pixmap.width() > 0:
-                old_zoom = current_pixmap.width() / self.base_pixmap.width()
+            if current_pixmap and self.base_image.width() > 0:
+                old_zoom = current_pixmap.width() / self.base_image.width()
             else:
                 old_zoom = 1.0
             self.zoom_factor = old_zoom
 
         viewport_size = self.scroll_area.viewport().size()
-        fit_scale_w = viewport_size.width() / float(self.base_pixmap.width())
-        fit_scale_h = viewport_size.height() / float(self.base_pixmap.height())
+        fit_scale_w = viewport_size.width() / float(self.base_image.width())
+        fit_scale_h = viewport_size.height() / float(self.base_image.height())
         fit_to_screen_zoom = min(fit_scale_w, fit_scale_h)
 
         max_allowed_zoom = max(1.0, fit_to_screen_zoom)
@@ -1265,14 +1424,14 @@ class ImageViewer(QMainWindow):
         self.smooth_zoom_timer.start(150)
 
     def reset_to_fit_screen(self):
-        if self.base_pixmap:
+        if self.base_image:
             self.is_custom_zoom = False
             self.zoom_factor = 1.0
             self.update_image_display(smooth=True)
             self.image_label.update()
 
     def reset_to_actual_size_or_fit(self):
-        if not self.base_pixmap or self.base_pixmap.isNull():
+        if not self.base_image or self.base_image.isNull():
             return
 
         is_already_actual = self.is_custom_zoom and abs(self.zoom_factor - 1.0) < 1e-5
@@ -1303,7 +1462,8 @@ class ImageViewer(QMainWindow):
         self.reposition_osd()
         self.reposition_progress_bar()
         if not self.is_custom_zoom:
-            self.update_image_display(smooth=True)
+            self.update_image_display(smooth=False)
+            self.smooth_zoom_timer.start(120)
 
 
 if __name__ == "__main__":
