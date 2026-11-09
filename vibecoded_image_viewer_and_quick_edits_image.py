@@ -1,6 +1,9 @@
 #sudo pacman -S python python-pillow python-pyqt6 
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+#sudo pacman -S python python-pillow python-pyqt6 
+#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 import os
 import random
 import subprocess
@@ -8,7 +11,7 @@ import sys
 import time
 from collections import deque
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageFilter, UnidentifiedImageError
 from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QThread, Qt, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -32,6 +35,7 @@ BTN_TEXT_PREV = "←"
 BTN_TEXT_NEXT = "→"
 BTN_TEXT_ROTATE_LEFT = "⟲"
 BTN_TEXT_ROTATE_RIGHT = "⟳"
+BTN_TEXT_SHARPEN = "✦"
 BTN_TEXT_CROP = "✃"
 BTN_TEXT_RESET_CROP = "↺"
 BTN_TEXT_SAVE = "↓"
@@ -47,6 +51,11 @@ SLIDESHOW_PRESETS_MS = [1000, 2000, 3000, 4000, 5500, 8000, 10000, 15000,
 
 HINT_DELAY_MS = 1000           # hover time before a button's description shows in the OSD
 
+# Sharpening (the "S" button / Shift+S), PIL's UnsharpMask
+SHARPEN_RADIUS = 3             # blur radius in px; larger = broader, coarser sharpening (try 0.5 - 5)
+SHARPEN_PERCENT = 30          # strength of the effect; 100 = mild, 150 = default, 300+ = harsh
+SHARPEN_THRESHOLD = 2          # min brightness difference (0-255) to sharpen; higher leaves smooth areas / noise alone
+
 UI_FONT_SIZE = "16px"
 BTN_WIDTH = 36
 BTN_HEIGHT = 36
@@ -55,8 +64,45 @@ SLIDER_HANDLE_COLOR = "#47567a"
 SLIDER_HOVER_COLOR = "#BFBFBF"
 
 
+class ProgressFile:
+    """File wrapper that reports how far through the file the decoder has read.
+
+    Decoders such as JPEG / PNG / BMP / TIFF / GIF pull the file in blocks while
+    decoding, so the read position is a faithful measure of decoding progress.
+    Reads are only counted once `counting` is switched on (right before load()),
+    so header parsing doesn't register. Formats that read the whole file up front
+    and decode from memory (WebP) report nothing until the decode is done.
+    """
+
+    def __init__(self, f, size, callback):
+        self._f = f
+        self._size = max(1, size)
+        self._callback = callback
+        self._last = -1
+        self.counting = False
+
+    def read(self, n=-1):
+        data = self._f.read(n)
+        if self.counting:
+            pct = min(100, self._f.tell() * 100 // self._size)
+            if pct > self._last:
+                self._last = pct
+                self._callback(pct)
+        return data
+
+    def seek(self, *args):
+        return self._f.seek(*args)
+
+    def tell(self):
+        return self._f.tell()
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+
 class MainImageWorker(QObject):
     finished = pyqtSignal(int, QImage, object, str)
+    progress = pyqtSignal(int, int)   # request_id, percent
 
     def __init__(self):
         super().__init__()
@@ -69,19 +115,33 @@ class MainImageWorker(QObject):
         if request_id != self.latest_request_id:
             return
         try:
-            with Image.open(image_path) as img:
-                img.load()
-                pil_img = img.copy()
+            # Rough share of the total time per stage (measured on a 40 MP JPEG):
+            # decoding fills 0-55 %, the conversion steps below fill the rest.
+            emit = self.progress.emit
+
+            with open(image_path, "rb") as f:
+                pf = ProgressFile(
+                    f, os.path.getsize(image_path),
+                    lambda pct: emit(request_id, pct * 55 // 100)
+                )
+                with Image.open(pf) as img:
+                    pf.counting = True
+                    img.load()
+                    pil_img = img.copy()
+            emit(request_id, 65)
 
             if rotation_angle != 0:
                 pil_img = pil_img.rotate(-rotation_angle, expand=True)
+                emit(request_id, 72)
 
             if pil_img.mode != "RGBA":
                 display_img = pil_img.convert("RGBA")
             else:
                 display_img = pil_img
+            emit(request_id, 82)
 
             data = display_img.tobytes("raw", "RGBA")
+            emit(request_id, 93)
             qimage = QImage(
                 data,
                 display_img.size[0],
@@ -121,6 +181,55 @@ class CacheWorker(QObject):
             self.cache_finished.emit(image_path, qimage, pil_img)
         except Exception:
             pass
+
+
+class SharpenWorker(QObject):
+    finished = pyqtSignal(int, QImage, object, str)
+    progress = pyqtSignal(int, int)   # request_id, percent
+
+    @pyqtSlot(int, object, float, int, int)
+    def process_sharpen(self, request_id, pil_img, radius, percent, threshold):
+        try:
+            src = pil_img
+            if src.mode in ("P", "1"):
+                src = src.convert("RGBA")
+
+            # PIL's filter is a single opaque call with no progress callback, so the
+            # image is sharpened in horizontal bands instead. Each band is cut with a
+            # margin of extra rows so the blur at band edges sees the real neighbouring
+            # pixels, which makes the stitched result match a one-shot sharpen.
+            width, height = src.size
+            unsharp = ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold)
+            margin = int(radius * 4) + 2
+            band_count = max(1, min(20, height // 64))
+            sharpened = Image.new(src.mode, src.size)
+
+            for i in range(band_count):
+                y0 = height * i // band_count
+                y1 = height * (i + 1) // band_count
+                top = max(0, y0 - margin)
+                bottom = min(height, y1 + margin)
+                band = src.crop((0, top, width, bottom)).filter(unsharp)
+                band = band.crop((0, y0 - top, width, y0 - top + (y1 - y0)))
+                sharpened.paste(band, (0, y0))
+                # keep the last few % for the QImage conversion below
+                self.progress.emit(request_id, (i + 1) * 95 // band_count)
+
+            display_img = sharpened
+            if display_img.mode != "RGBA":
+                display_img = display_img.convert("RGBA")
+
+            data = display_img.tobytes("raw", "RGBA")
+            qimage = QImage(
+                data,
+                display_img.size[0],
+                display_img.size[1],
+                QImage.Format.Format_RGBA8888
+            ).copy()
+
+            self.finished.emit(request_id, qimage, sharpened, "")
+        except Exception as err:
+            self.finished.emit(request_id, QImage(), None, str(err))
 
 
 class HoverHintController(QObject):
@@ -267,6 +376,7 @@ class ImageCanvas(QLabel):
 class ImageViewer(QMainWindow):
     request_processing = pyqtSignal(int, str, float)
     request_cache = pyqtSignal(str)
+    request_sharpen = pyqtSignal(int, object, float, int, int)
 
     def __init__(self, initial_path=None):
         super().__init__()
@@ -319,10 +429,10 @@ class ImageViewer(QMainWindow):
         self.osd_timer.setSingleShot(True)
         self.osd_timer.timeout.connect(self.hide_osd)
 
-        self.simulated_progress_timer = QTimer(self)
-        self.simulated_progress_timer.setInterval(20)
-        self.simulated_progress_timer.timeout.connect(self.increment_simulated_progress)
-        self.current_progress_value = 0
+        # sharpening runs in a worker thread that reports real progress
+        self.sharpen_busy = False
+        self.sharpen_request_id = 0
+        self.sharpen_source = None
 
         self._was_fullscreen = False
 
@@ -361,6 +471,7 @@ class ImageViewer(QMainWindow):
         self.main_worker.moveToThread(self.main_worker_thread)
         self.request_processing.connect(self.main_worker.process_image)
         self.main_worker.finished.connect(self.on_image_processed)
+        self.main_worker.progress.connect(self.on_load_progress)
         self.main_worker_thread.start()
 
         self.cache_worker_thread = QThread()
@@ -370,11 +481,21 @@ class ImageViewer(QMainWindow):
         self.cache_worker.cache_finished.connect(self.on_cache_processed)
         self.cache_worker_thread.start()
 
+        self.sharpen_worker_thread = QThread()
+        self.sharpen_worker = SharpenWorker()
+        self.sharpen_worker.moveToThread(self.sharpen_worker_thread)
+        self.request_sharpen.connect(self.sharpen_worker.process_sharpen)
+        self.sharpen_worker.finished.connect(self.on_sharpen_processed)
+        self.sharpen_worker.progress.connect(self.on_sharpen_progress)
+        self.sharpen_worker_thread.start()
+
     def closeEvent(self, event):
         self.main_worker_thread.quit()
         self.cache_worker_thread.quit()
+        self.sharpen_worker_thread.quit()
         self.main_worker_thread.wait()
         self.cache_worker_thread.wait()
+        self.sharpen_worker_thread.wait()
         super().closeEvent(event)
 
     def init_ui(self):
@@ -453,6 +574,11 @@ class ImageViewer(QMainWindow):
         self.btn_rotate_right.clicked.connect(self.rotate_right)
         self.btn_rotate_right.setEnabled(False)
         self.buttons.append(self.btn_rotate_right)
+
+        self.btn_sharpen = TipButton(BTN_TEXT_SHARPEN, "Sharpen  (Shift+S)", self.tips)
+        self.btn_sharpen.clicked.connect(self.sharpen_image)
+        self.btn_sharpen.setEnabled(False)
+        self.buttons.append(self.btn_sharpen)
 
         self.btn_crop = TipButton(BTN_TEXT_CROP, "Crop to selection  (C)  ·  right-drag to select", self.tips)
         self.btn_crop.clicked.connect(self.crop_selection)
@@ -689,7 +815,14 @@ class ImageViewer(QMainWindow):
                     self.crop_selection()
                 return True
             elif event.key() == Qt.Key.Key_S:
-                self.save_image()
+                mods = event.modifiers()
+                if mods & Qt.KeyboardModifier.ControlModifier:
+                    pass  # Ctrl+S intentionally does nothing
+                elif mods & Qt.KeyboardModifier.ShiftModifier:
+                    if not self.slideshow_timer.isActive():
+                        self.sharpen_image()
+                else:
+                    self.save_image()
                 return True
             elif event.key() == Qt.Key.Key_I:
                 self.show_image_info()
@@ -830,6 +963,7 @@ class ImageViewer(QMainWindow):
         if has_images and not is_slideshow:
             self.btn_rotate_left.setEnabled(True)
             self.btn_rotate_right.setEnabled(True)
+            self.btn_sharpen.setEnabled(True)
             self.btn_crop.setEnabled(True)
             self.btn_reset_crop.setEnabled(True)
             self.btn_save.setEnabled(True)
@@ -837,6 +971,7 @@ class ImageViewer(QMainWindow):
         else:
             self.btn_rotate_left.setEnabled(False)
             self.btn_rotate_right.setEnabled(False)
+            self.btn_sharpen.setEnabled(False)
             self.btn_crop.setEnabled(False)
             self.btn_reset_crop.setEnabled(False)
             self.btn_save.setEnabled(False)
@@ -907,6 +1042,66 @@ class ImageViewer(QMainWindow):
         self.base_image = qimage
         self.update_image_display(smooth=True)
         self.show_osd("image Minified to 1080p", duration=1500)
+
+    def sharpen_image(self):
+        if self.slideshow_timer.isActive():
+            return
+        if self.current_pil_image is None or self.sharpen_busy:
+            return
+
+        # a new id means any pending load/sharpen result for an older state is ignored
+        self.request_counter += 1
+        self.sharpen_request_id = self.request_counter
+        self.sharpen_source = self.current_pil_image
+        self.sharpen_busy = True
+        self.image_label.clear_selection()
+
+        self.progress_bar.setValue(0)
+        self.reposition_progress_bar()
+        self.progress_bar.show()
+        self.progress_bar.raise_()
+
+        self.request_sharpen.emit(
+            self.sharpen_request_id,
+            self.sharpen_source,
+            float(SHARPEN_RADIUS),
+            int(SHARPEN_PERCENT),
+            int(SHARPEN_THRESHOLD),
+        )
+
+    @pyqtSlot(int, int)
+    def on_sharpen_progress(self, request_id, percent):
+        # ignore progress from a sharpen the user has since navigated / rotated away from
+        if not self.sharpen_busy or request_id != self.request_counter:
+            return
+        self.progress_bar.setValue(percent)
+
+    @pyqtSlot(int, QImage, object, str)
+    def on_sharpen_processed(self, request_id, qimage, pil_img, error_msg):
+        self.sharpen_busy = False
+        source = self.sharpen_source
+        self.sharpen_source = None
+
+        # something else (navigation, rotate, reset, save) took over: it owns the bar now
+        if request_id != self.request_counter:
+            return
+
+        self.progress_bar.setValue(100)
+        QTimer.singleShot(150, self.progress_bar.hide)
+
+        if error_msg:
+            self.show_osd(f"Could not sharpen:\n{error_msg}", duration=2000)
+            return
+
+        # a crop / minify happened while sharpening: don't overwrite it
+        if self.current_pil_image is not source:
+            return
+
+        self.current_pil_image = pil_img
+        self.rotation_angle = 0
+        self.base_image = qimage
+        self.update_image_display(smooth=True)
+        self.show_osd("Sharpened in memory (Click Save to write)", duration=1500)
 
     def show_random_image(self):
         if not self.image_files:
@@ -1075,12 +1270,10 @@ class ImageViewer(QMainWindow):
             self.request_counter += 1
             self.main_worker.latest_request_id = self.request_counter
             
-            self.current_progress_value = 0
             self.progress_bar.setValue(0)
             self.reposition_progress_bar()
             self.progress_bar.show()
             self.progress_bar.raise_()
-            self.simulated_progress_timer.start()
             
             self.request_processing.emit(
                 self.request_counter,
@@ -1088,17 +1281,18 @@ class ImageViewer(QMainWindow):
                 float(self.rotation_angle)
             )
 
-    def increment_simulated_progress(self):
-        if self.current_progress_value < 90:
-            self.current_progress_value += 5
-            self.progress_bar.setValue(self.current_progress_value)
+    @pyqtSlot(int, int)
+    def on_load_progress(self, request_id, percent):
+        # ignore progress from a load the user has already moved on from
+        if request_id != self.request_counter:
+            return
+        self.progress_bar.setValue(percent)
 
     @pyqtSlot(int, QImage, object, str)
     def on_image_processed(self, request_id, qimage, pil_img, error_msg):
         if request_id != self.request_counter:
             return
 
-        self.simulated_progress_timer.stop()
         self.progress_bar.setValue(100)
         QTimer.singleShot(150, self.progress_bar.hide)
 
