@@ -1,9 +1,6 @@
 #sudo pacman -S python python-pillow python-pyqt6 
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-#sudo pacman -S python python-pillow python-pyqt6 
-#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
-
 import os
 import random
 import subprocess
@@ -11,7 +8,6 @@ import sys
 import time
 from collections import deque
 
-from PIL import Image, ImageFilter, UnidentifiedImageError
 from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QThread, Qt, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -115,6 +111,8 @@ class MainImageWorker(QObject):
         if request_id != self.latest_request_id:
             return
         try:
+            from PIL import Image, UnidentifiedImageError
+
             # Rough share of the total time per stage (measured on a 40 MP JPEG):
             # decoding fills 0-55 %, the conversion steps below fill the rest.
             emit = self.progress.emit
@@ -161,6 +159,8 @@ class CacheWorker(QObject):
     @pyqtSlot(str)
     def preload_image(self, image_path):
         try:
+            from PIL import Image
+
             with Image.open(image_path) as img:
                 img.load()
                 pil_img = img.copy()
@@ -190,6 +190,8 @@ class SharpenWorker(QObject):
     @pyqtSlot(int, object, float, int, int)
     def process_sharpen(self, request_id, pil_img, radius, percent, threshold):
         try:
+            from PIL import Image, ImageFilter
+
             src = pil_img
             if src.mode in ("P", "1"):
                 src = src.convert("RGBA")
@@ -438,12 +440,24 @@ class ImageViewer(QMainWindow):
 
         self.init_ui()
         self.apply_dark_theme()
-        self.setup_worker_threads()
+
+        # Save initial path for deferred post-show loading
+        self._initial_path = initial_path
+        self.threads_initialized = False
 
         QApplication.instance().installEventFilter(self)
 
-        if initial_path:
-            self.load_from_path(initial_path)
+        # Defer thread initialization and folder scanning until after the window is drawn
+        QTimer.singleShot(0, self.complete_startup)
+
+    def complete_startup(self):
+        if not self.threads_initialized:
+            self.setup_worker_threads()
+            self.threads_initialized = True
+        if self._initial_path:
+            path = self._initial_path
+            self._initial_path = None
+            self.load_from_path(path)
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
@@ -490,12 +504,13 @@ class ImageViewer(QMainWindow):
         self.sharpen_worker_thread.start()
 
     def closeEvent(self, event):
-        self.main_worker_thread.quit()
-        self.cache_worker_thread.quit()
-        self.sharpen_worker_thread.quit()
-        self.main_worker_thread.wait()
-        self.cache_worker_thread.wait()
-        self.sharpen_worker_thread.wait()
+        if self.threads_initialized:
+            self.main_worker_thread.quit()
+            self.cache_worker_thread.quit()
+            self.sharpen_worker_thread.quit()
+            self.main_worker_thread.wait()
+            self.cache_worker_thread.wait()
+            self.sharpen_worker_thread.wait()
         super().closeEvent(event)
 
     def init_ui(self):
@@ -983,6 +998,8 @@ class ImageViewer(QMainWindow):
         
         image_path = self.image_files[self.current_index]
         try:
+            from PIL import Image
+
             file_size_bytes = os.path.getsize(image_path)
             file_size_mb = file_size_bytes / (1024 * 1024)
             
@@ -1002,6 +1019,8 @@ class ImageViewer(QMainWindow):
             return
         if self.current_pil_image is None:
             return
+
+        from PIL import Image
 
         width, height = self.current_pil_image.size
         long_edge = max(width, height)
