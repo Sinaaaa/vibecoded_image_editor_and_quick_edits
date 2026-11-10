@@ -1,5 +1,5 @@
 #sudo pacman -S python python-pillow python-pyqt6 
-#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
+#NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 import os
 import sys
@@ -432,6 +432,7 @@ class ImageViewer(QMainWindow):
         self.is_custom_zoom = False
 
         self.slideshow_interval_ms = SLIDESHOW_INTERVAL_MS
+        self.slideshow_random = True   # False = sequential order
 
         self.request_counter = 0
         self.scan_counter = 0
@@ -690,7 +691,7 @@ class ImageViewer(QMainWindow):
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         self.buttons.append(self.btn_fullscreen)
 
-        self.btn_slideshow = TipButton(BTN_TEXT_SLIDESHOW, "Random slideshow  ·  right-click to set the interval", self.tips)
+        self.btn_slideshow = TipButton(BTN_TEXT_SLIDESHOW, "Slideshow", self.tips)
         self.btn_slideshow.clicked.connect(self.toggle_slideshow)
         self.btn_slideshow.setEnabled(False)
         self.btn_slideshow.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -998,14 +999,20 @@ class ImageViewer(QMainWindow):
         return f"{ms / 1000:g} s"
 
     def refresh_slideshow_tip(self):
+        mode = "random" if self.slideshow_random else "sequential"
+        interval = self.format_interval(self.slideshow_interval_ms).replace(" ", "")
         self.btn_slideshow.set_tip(
-            f"Random slideshow, {self.format_interval(self.slideshow_interval_ms)} per image"
-            "  ·  right-click to change"
+            f"Slideshow, {interval} per image, M:{mode}, right click to change"
         )
 
     def show_slideshow_menu(self, _pos):
         self.tips.cancel()
         menu = QMenu(self.btn_slideshow)
+        for is_random, name in ((True, "Random"), (False, "Sequential")):
+            marker = "✓  " if is_random == self.slideshow_random else "     "
+            action = menu.addAction(marker + name)
+            action.triggered.connect(lambda _checked=False, v=is_random: self.set_slideshow_mode(v))
+        menu.addSeparator()
         values = sorted(set(SLIDESHOW_PRESETS_MS) | {self.slideshow_interval_ms})
         for ms in values:
             label = self.format_interval(ms)
@@ -1019,6 +1026,11 @@ class ImageViewer(QMainWindow):
         menu.ensurePolished()
         origin = self.btn_slideshow.mapToGlobal(QPoint(0, 0))
         menu.exec(QPoint(origin.x(), origin.y() - menu.sizeHint().height()))
+
+    def set_slideshow_mode(self, is_random):
+        self.slideshow_random = is_random
+        self.refresh_slideshow_tip()
+        self.show_osd(f"Slideshow mode: {'random' if is_random else 'sequential'}", duration=1000)
 
     def set_slideshow_interval(self, ms):
         self.slideshow_interval_ms = ms
@@ -1190,6 +1202,8 @@ class ImageViewer(QMainWindow):
             return
         if len(self.image_files) == 1:
             next_idx = 0
+        elif not self.slideshow_random:
+            next_idx = (self.current_index + 1) % len(self.image_files)
         else:
             import random
 
