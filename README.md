@@ -16,10 +16,11 @@ Designed for speed, minimal UI clutter, and quick edits — perfect for browsing
 - 🖱️ **Pan & zoom** – Click‑drag to pan, scroll to zoom. Right‑click to select a crop area.
 - 🌀 **Rotate** – 90° left/right, non‑destructive in memory until you save.
 - ✂️ **Crop** – Select an area with right‑click, then crop. Saved on write.
+- ✦ **Sharpen** – Applies an unsharp mask to the current image, with a progress bar while it works. Done in memory until you save.
 - 🔍 **Minify** – Downscale to 1920px on the long edge (great for reducing file size).
-- 🎞️ **Slideshow** – Random slideshow with a 5.5s interval.
+- 🎞️ **Slideshow** – Runs in **random** (default) or **sequential** order, 5.5s per image by default. Right‑click the `⏱` button to switch the mode or change the interval (1s to 5 min).
 - 🗑️ **Trash** – Move current image to system trash (via `gio trash`).
-- 📊 **OSD notifications** – Feedback for actions (minify, save, crop, etc.).
+- 📊 **OSD notifications** – Feedback for actions (minify, save, crop, etc.). Hover over a button for a moment to see what it does.
 - ⌨️ **Keyboard shortcuts** – Full keyboard support (see below).
 
 ---
@@ -33,11 +34,12 @@ Designed for speed, minimal UI clutter, and quick edits — perfect for browsing
 | `→`   | Next image |
 | `⟲`   | Rotate left (−90°) |
 | `⟳`   | Rotate right (+90°) |
+| `✦`   | Sharpen image |
 | `✃`   | Crop selected area |
 | `↺`   | Reset crop / reload current image |
 | `↓`   | Save current image (overwrites original) |
 | `⇱`   | Toggle fullscreen |
-| `⏱`   | Start / stop slideshow |
+| `⏱`   | Start / stop slideshow (right‑click: random / sequential mode and interval) |
 | `💬`   | Show image info (resolution + file size) |
 | `→←`  | Minify to 1920px long edge |
 | `✕`   | Exit |
@@ -52,6 +54,7 @@ Designed for speed, minimal UI clutter, and quick edits — perfect for browsing
 | `L` | Rotate left |
 | `R` | Rotate right |
 | `C` | Crop selected area |
+| `Shift+S` | Sharpen image |
 | `S` | Save image |
 | `I` | Show image info |
 | `M` | Minify image |
@@ -64,6 +67,20 @@ Designed for speed, minimal UI clutter, and quick edits — perfect for browsing
 | `Mouse wheel` | Zoom in/out |
 | `Left‑click + drag` | Pan (move image) |
 | `Right‑click + drag` | Select crop area |
+
+---
+
+## 🎞️ Slideshow
+
+Click `⏱` to start or stop. Hover over the button to see the current settings, e.g. `Slideshow, 5.5s per image, M:random, right click to change`.
+
+Right‑click the button to choose:
+
+- **Random** (default) – picks a different random image each time.
+- **Sequential** – goes through the folder in filename order and wraps around at the end.
+- **Interval** – 1s, 2s, 3s, 4s, 5.5s (default), 8s, 10s, 15s, 30s, 1 min, 2 min or 5 min.
+
+`←` / `→` still step back and forward through the images already shown, in both modes. Editing buttons are disabled while the slideshow is running.
 
 ---
 
@@ -122,13 +139,7 @@ MimeType=image/jpeg;image/png;image/webp;image/bmp;image/gif;image/tiff;image/x-
 Categories=Graphics;Viewer;
 ```
 
-### 3. Make it executable
-
-```bash
-chmod +x ~/.local/share/applications/vibecoded-viewer.desktop
-```
-
-### 4. Set as default (optional)
+### 3. Set as default (optional)
 
 Right‑click any image → **Open With** → **Other Application** → select **Vibecoded Image Viewer** and check **"Always use for this file type"**.
 
@@ -136,7 +147,8 @@ Right‑click any image → **Open With** → **Other Application** → select *
 
 ## 🧠 Notes
 
-- All edits (rotate, crop, minify) happen **in memory** until you press `Save` – the original file is overwritten.
+- All edits (rotate, crop, sharpen, minify) happen **in memory** until you press `Save` – the original file is overwritten.
+- Sharpening strength is set by `SHARPEN_RADIUS`, `SHARPEN_PERCENT` and `SHARPEN_THRESHOLD` near the top of the script.
 - The viewer **does not require a GPU** – uses CPU rendering.
 - Supports common formats: `jpg`, `jpeg`, `png`, `webp`, `bmp`, `gif`, `tiff`, `tif`, `ico`.
 
@@ -147,4 +159,3 @@ Right‑click any image → **Open With** → **Other Application** → select *
 MIT — free to use, modify, and distribute.
 
 ---
-
