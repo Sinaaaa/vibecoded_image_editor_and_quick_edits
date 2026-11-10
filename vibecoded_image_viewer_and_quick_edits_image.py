@@ -2,8 +2,6 @@
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 import os
-import random
-import subprocess
 import sys
 import time
 from collections import deque
@@ -234,6 +232,31 @@ class SharpenWorker(QObject):
             self.finished.emit(request_id, QImage(), None, str(err))
 
 
+class FolderScanWorker(QObject):
+    # request_id, sorted image paths, index of the selected file (or 0 / -1), ok
+    finished = pyqtSignal(int, object, int, bool)
+
+    @pyqtSlot(int, str, str, object)
+    def scan(self, request_id, folder_path, selected_file, extensions):
+        try:
+            all_files = os.listdir(folder_path)
+        except OSError:
+            self.finished.emit(request_id, [], -1, False)
+            return
+
+        image_files = []
+        for f in sorted(all_files):
+            if f.lower().endswith(extensions):
+                image_files.append(os.path.normpath(os.path.join(folder_path, f)))
+
+        if selected_file in image_files:
+            index = image_files.index(selected_file)
+        else:
+            index = 0 if image_files else -1
+
+        self.finished.emit(request_id, image_files, index, True)
+
+
 class HoverHintController(QObject):
     """Shows a button's description in the OSD after the cursor rests on it.
 
@@ -379,6 +402,7 @@ class ImageViewer(QMainWindow):
     request_processing = pyqtSignal(int, str, float)
     request_cache = pyqtSignal(str)
     request_sharpen = pyqtSignal(int, object, float, int, int)
+    request_scan = pyqtSignal(int, str, str, object)
 
     def __init__(self, initial_path=None):
         super().__init__()
@@ -410,6 +434,7 @@ class ImageViewer(QMainWindow):
         self.slideshow_interval_ms = SLIDESHOW_INTERVAL_MS
 
         self.request_counter = 0
+        self.scan_counter = 0
 
         self.load_timer = QTimer(self)
         self.load_timer.setSingleShot(True)
@@ -439,7 +464,7 @@ class ImageViewer(QMainWindow):
         self._was_fullscreen = False
 
         self.init_ui()
-        self.apply_dark_theme()
+        self.apply_initial_theme()
 
         # Save initial path for deferred post-show loading
         self._initial_path = initial_path
@@ -447,10 +472,22 @@ class ImageViewer(QMainWindow):
 
         QApplication.instance().installEventFilter(self)
 
-        # Defer thread initialization and folder scanning until after the window is drawn
-        QTimer.singleShot(0, self.complete_startup)
+        # Everything below runs after the window has been shown and painted once:
+        # complete_startup() is kicked off from __main__.
+        self._startup_started = False
 
     def complete_startup(self):
+        # step 1: toolbar buttons + full stylesheet (the window is already visible)
+        if self._startup_started:
+            return
+        self._startup_started = True
+        self.build_controls()
+        self.apply_dark_theme()
+        # step 2 in a separate event-loop pass so the finished toolbar can paint first
+        QTimer.singleShot(0, self.start_workers_and_load)
+
+    def start_workers_and_load(self):
+        # step 2: worker threads, then the folder scan / first image
         if not self.threads_initialized:
             self.setup_worker_threads()
             self.threads_initialized = True
@@ -503,14 +540,23 @@ class ImageViewer(QMainWindow):
         self.sharpen_worker.progress.connect(self.on_sharpen_progress)
         self.sharpen_worker_thread.start()
 
+        self.scan_worker_thread = QThread()
+        self.scan_worker = FolderScanWorker()
+        self.scan_worker.moveToThread(self.scan_worker_thread)
+        self.request_scan.connect(self.scan_worker.scan)
+        self.scan_worker.finished.connect(self.on_scan_finished)
+        self.scan_worker_thread.start()
+
     def closeEvent(self, event):
         if self.threads_initialized:
             self.main_worker_thread.quit()
             self.cache_worker_thread.quit()
             self.sharpen_worker_thread.quit()
+            self.scan_worker_thread.quit()
             self.main_worker_thread.wait()
             self.cache_worker_thread.wait()
             self.sharpen_worker_thread.wait()
+            self.scan_worker_thread.wait()
         super().closeEvent(event)
 
     def init_ui(self):
@@ -556,6 +602,36 @@ class ImageViewer(QMainWindow):
         wrapper_layout.addStretch()
         wrapper_layout.addWidget(self.controls_widget)
         wrapper_layout.addStretch()
+
+        # The strip is created empty (and keeps its final height) so the window can be
+        # shown immediately; the buttons themselves are built in build_controls().
+        self.controls_layout = controls_layout
+        self.controls_wrapper.setMinimumHeight(BTN_HEIGHT)
+        self.buttons = []
+
+        main_layout.addWidget(self.controls_wrapper)
+
+        self.osd_label = QLabel(self.central_widget)
+        self.osd_label.setStyleSheet("""
+            background-color: rgba(0, 0, 0, 180);
+            color: white;
+            padding: 8px 16px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 8px;
+        """)
+        self.osd_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.osd_label.hide()
+
+        self.progress_bar = QProgressBar(self.central_widget)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+
+    def build_controls(self):
+        controls_layout = self.controls_layout
 
         self.tips = HoverHintController(self)
         self.buttons = []
@@ -641,27 +717,6 @@ class ImageViewer(QMainWindow):
             btn.setFixedWidth(BTN_WIDTH)
             btn.setFixedHeight(BTN_HEIGHT)
             controls_layout.addWidget(btn)
-
-        main_layout.addWidget(self.controls_wrapper)
-
-        self.osd_label = QLabel(self.central_widget)
-        self.osd_label.setStyleSheet("""
-            background-color: rgba(0, 0, 0, 180);
-            color: white;
-            padding: 8px 16px;
-            font-size: 16px;
-            font-weight: bold;
-            border-radius: 8px;
-        """)
-        self.osd_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.osd_label.hide()
-
-        self.progress_bar = QProgressBar(self.central_widget)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(4)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.hide()
 
     def get_stylesheet(self, fullscreen=False):
         bg_color = "#000000"
@@ -801,6 +856,14 @@ class ImageViewer(QMainWindow):
 
     def apply_dark_theme(self):
         self.setStyleSheet(self.get_stylesheet(fullscreen=self.isFullScreen()))
+
+    def apply_initial_theme(self):
+        # just enough to paint a black window with the dark toolbar strip immediately;
+        # the full stylesheet is applied in complete_startup once the buttons exist
+        self.setStyleSheet(
+            "QWidget { background-color: #000000; color: #e0e0e0; }"
+            "QWidget#controlsWrapper, QWidget#controlsWidget { background-color: #181818; }"
+        )
 
     def eventFilter(self, source, event):
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -1128,6 +1191,8 @@ class ImageViewer(QMainWindow):
         if len(self.image_files) == 1:
             next_idx = 0
         else:
+            import random
+
             next_idx = self.current_index
             while next_idx == self.current_index:
                 next_idx = random.randint(0, len(self.image_files) - 1)
@@ -1144,10 +1209,15 @@ class ImageViewer(QMainWindow):
         if self.slideshow_timer.isActive():
             self.toggle_slideshow()
             
+        # start in the folder of the current image (empty = let the dialog decide)
+        start_dir = ""
+        if 0 <= self.current_index < len(self.image_files):
+            start_dir = os.path.dirname(self.image_files[self.current_index])
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Image File",
-            "",
+            start_dir,
             "Image Files (*.jpeg *.jpg *.png *.webp *.bmp *.gif *.tiff *.tif *.ico)"
         )
         if file_path:
@@ -1166,24 +1236,19 @@ class ImageViewer(QMainWindow):
         self.scan_folder(folder_path, selected_file)
 
     def scan_folder(self, folder_path, selected_file):
-        try:
-            all_files = os.listdir(folder_path)
-        except OSError:
+        # the directory listing + sort runs in a worker thread so a huge or slow
+        # (network) folder can't freeze the window; the result lands in on_scan_finished
+        self.scan_counter += 1
+        self.request_scan.emit(self.scan_counter, folder_path, selected_file, self.supported_extensions)
+
+    @pyqtSlot(int, object, int, bool)
+    def on_scan_finished(self, request_id, image_files, index, ok):
+        if request_id != self.scan_counter or not ok:
             return
 
-        self.image_files = []
+        self.image_files = image_files
         self.image_cache.clear()
-
-        for f in sorted(all_files):
-            if f.lower().endswith(self.supported_extensions):
-                full_path = os.path.normpath(os.path.join(folder_path, f))
-                self.image_files.append(full_path)
-
-        if selected_file in self.image_files:
-            self.current_index = self.image_files.index(selected_file)
-        else:
-            self.current_index = 0 if self.image_files else -1
-
+        self.current_index = index
         self.load_current_image()
 
     def load_current_image(self):
@@ -1523,6 +1588,8 @@ class ImageViewer(QMainWindow):
             if image_path in self.image_cache:
                 del self.image_cache[image_path]
 
+            import subprocess
+
             abs_path = os.path.abspath(image_path)
             result = subprocess.run(["gio", "trash", abs_path], capture_output=True, text=True)
             if result.returncode != 0:
@@ -1677,6 +1744,12 @@ class ImageViewer(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Use the desktop portal's native file picker (GTK / GNOME / KDE) instead of Qt's
+    # built-in dialog. Must be set before QApplication exists. An already-set
+    # QT_QPA_PLATFORMTHEME (e.g. kde, qt6ct) is left alone; falls back to Qt's dialog
+    # if no portal is running.
+    os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
@@ -1684,4 +1757,6 @@ if __name__ == "__main__":
     
     viewer = ImageViewer(initial_path)
     viewer.show()
+    app.processEvents()   # paint the bare window right away
+    QTimer.singleShot(0, viewer.complete_startup)
     sys.exit(app.exec())
