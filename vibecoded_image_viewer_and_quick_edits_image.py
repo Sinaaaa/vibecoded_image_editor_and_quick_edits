@@ -1,12 +1,13 @@
 #sudo pacman -S python python-pillow python-pyqt6 
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+import math
 import os
 import sys
 import time
 from collections import deque
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QThread, Qt, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, QThread, Qt, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -332,6 +333,117 @@ class ImageCanvas(QLabel):
         self.is_panning = False
         self.pan_start_pos = QPoint()
         self.selection_start_pos = QPoint()
+        # zoomed-in view: the picture is not turned into a giant pixmap; only the
+        # exposed part is scaled and painted straight from the source image
+        self.virtual_image = None
+        self.virtual_size = QSize()
+        self.virtual_smooth = False
+        self.tiles = {}        # cached smooth tiles, see paint_virtual
+        self.tile_key = None
+
+    def set_virtual(self, image, size, smooth):
+        self.virtual_image = image
+        self.virtual_size = size
+        self.virtual_smooth = smooth
+        super().clear()   # drop any old pixmap / text
+        self.update()
+
+    def clear_virtual(self):
+        self.virtual_image = None
+        self.virtual_size = QSize()
+        self.tiles = {}
+        self.tile_key = None
+
+    def clear(self):
+        self.clear_virtual()
+        super().clear()
+
+    def displayed_size(self):
+        """Size of the picture as currently shown (QSize(), if there is none)."""
+        if self.virtual_image is not None:
+            return self.virtual_size
+        pixmap = self.pixmap()
+        if pixmap and not pixmap.isNull():
+            return pixmap.size()
+        return QSize()
+
+    def paint_virtual(self, exposed):
+        vw, vh = self.virtual_size.width(), self.virtual_size.height()
+        if vw <= 0 or vh <= 0:
+            return
+        ox = (self.width() - vw) // 2
+        oy = (self.height() - vh) // 2
+        target = exposed.intersected(QRect(ox, oy, vw, vh))
+        if target.isEmpty():
+            return
+
+        image = self.virtual_image
+        ratio_x = image.width() / vw
+        ratio_y = image.height() / vh
+
+        painter = QPainter(self)
+        try:
+            if not self.virtual_smooth or ratio_x < 1.0:
+                # Straight from the source image: cost depends only on the number
+                # of pixels painted. The source->screen mapping is absolute, so
+                # separately painted areas always line up. Bilinear when smooth
+                # (that is exactly what upscaling needs), nearest while zooming.
+                if self.virtual_smooth:
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                painter.drawImage(
+                    QRectF(target),
+                    image,
+                    QRectF(
+                        (target.left() - ox) * ratio_x,
+                        (target.top() - oy) * ratio_y,
+                        target.width() * ratio_x,
+                        target.height() * ratio_y,
+                    ),
+                )
+                return
+
+            # Smooth downscale: high-quality scaler, but on fixed grid tiles that
+            # are rendered once and cached. A partial repaint (e.g. the crop
+            # rectangle moving) just re-blits the same tiles, so the picture
+            # underneath can never change look or shimmer.
+            key = (image.cacheKey(), vw, vh)
+            if key != self.tile_key:
+                self.tiles = {}
+                self.tile_key = key
+            tile_px = max(64, min(512, int(2048 / ratio_x)))
+            first_tx = (target.left() - ox) // tile_px
+            last_tx = (target.right() - ox) // tile_px
+            first_ty = (target.top() - oy) // tile_px
+            last_ty = (target.bottom() - oy) // tile_px
+            for ty in range(first_ty, last_ty + 1):
+                for tx in range(first_tx, last_tx + 1):
+                    tile = self.tiles.get((tx, ty))
+                    if tile is None:
+                        tile = self.render_tile(image, vw, vh, tx, ty, tile_px, ratio_x, ratio_y)
+                        if len(self.tiles) >= 96:
+                            self.tiles = {}
+                        self.tiles[(tx, ty)] = tile
+                    painter.drawImage(ox + tx * tile_px, oy + ty * tile_px, tile)
+        finally:
+            painter.end()
+
+    @staticmethod
+    def render_tile(image, vw, vh, tx, ty, tile_px, ratio_x, ratio_y):
+        x0, y0 = tx * tile_px, ty * tile_px
+        w = min(tile_px, vw - x0)
+        h = min(tile_px, vh - y0)
+        sx1 = max(0, int(x0 * ratio_x))
+        sy1 = max(0, int(y0 * ratio_y))
+        sx2 = min(image.width(), max(sx1 + 1, math.ceil((x0 + w) * ratio_x)))
+        sy2 = min(image.height(), max(sy1 + 1, math.ceil((y0 + h) * ratio_y)))
+        tile = image.copy(QRect(sx1, sy1, sx2 - sx1, sy2 - sy1))
+        if tile.width() != w or tile.height() != h:
+            tile = tile.scaled(
+                w, h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        return tile
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -377,8 +489,11 @@ class ImageCanvas(QLabel):
             self.set_selection_rect(QRect(self.selection_start_pos, current_pos).normalized())
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.selection_rect.isNull() and self.pixmap():
+        if self.virtual_image is not None:
+            self.paint_virtual(event.rect())
+        else:
+            super().paintEvent(event)
+        if not self.selection_rect.isNull() and not self.displayed_size().isEmpty():
             painter = QPainter(self)
             pen = QPen(QColor("#007acc"), 2, Qt.PenStyle.DashLine)
             painter.setPen(pen)
@@ -452,6 +567,13 @@ class ImageViewer(QMainWindow):
         self.smooth_zoom_timer = QTimer(self)
         self.smooth_zoom_timer.setSingleShot(True)
         self.smooth_zoom_timer.timeout.connect(lambda: self.update_image_display(smooth=True))
+
+        # wheel zoom steps are collapsed into one render per ~16 ms, so a burst of
+        # wheel events on a huge image can't queue up several full-size rescales
+        self.wheel_render_timer = QTimer(self)
+        self.wheel_render_timer.setSingleShot(True)
+        self.wheel_render_timer.timeout.connect(self.apply_wheel_zoom)
+        self.wheel_anchor = None   # (cursor_pos, content_x, content_y, rendered_zoom)
 
         self.osd_timer = QTimer(self)
         self.osd_timer.setSingleShot(True)
@@ -1420,6 +1542,7 @@ class ImageViewer(QMainWindow):
         if not self.base_image or self.base_image.isNull():
             # placeholder / error text: let the label fill the viewport so the
             # centered text is never clipped to a stale, too-small label size
+            self.image_label.clear_virtual()
             self.image_label.resize(self.scroll_area.viewport().size())
             return
 
@@ -1435,24 +1558,20 @@ class ImageViewer(QMainWindow):
                 transform_mode
             )
             self.image_label.resize(viewport_size)
+            self.image_label.clear_virtual()
+            self.image_label.setPixmap(QPixmap.fromImage(scaled_pixmap))
         else:
             target_w = int(self.base_image.width() * self.zoom_factor)
             target_h = int(self.base_image.height() * self.zoom_factor)
-            
-            if target_w > 0 and target_h > 0:
-                scaled_pixmap = self.base_image.scaled(
-                    target_w, target_h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    transform_mode
-                )
-            else:
-                scaled_pixmap = self.base_image
+            if target_w <= 0 or target_h <= 0:
+                target_w, target_h = self.base_image.width(), self.base_image.height()
 
-            label_w = max(viewport_size.width(), scaled_pixmap.width())
-            label_h = max(viewport_size.height(), scaled_pixmap.height())
+            # zoomed view: no full-size scaled copy / pixmap, the canvas paints just
+            # the exposed part from base_image (see ImageCanvas.paint_virtual)
+            label_w = max(viewport_size.width(), target_w)
+            label_h = max(viewport_size.height(), target_h)
             self.image_label.resize(label_w, label_h)
-
-        self.image_label.setPixmap(QPixmap.fromImage(scaled_pixmap))
+            self.image_label.set_virtual(self.base_image, QSize(target_w, target_h), smooth)
 
     def crop_selection(self):
         if self.slideshow_timer.isActive():
@@ -1460,12 +1579,11 @@ class ImageViewer(QMainWindow):
         if self.current_pil_image is None or self.image_label.selection_rect.isEmpty():
             return
 
-        pixmap = self.image_label.pixmap()
-        if not pixmap or pixmap.width() == 0 or pixmap.height() == 0:
+        pixmap_size = self.image_label.displayed_size()
+        if pixmap_size.width() == 0 or pixmap_size.height() == 0:
             return
 
         label_size = self.image_label.size()
-        pixmap_size = pixmap.size()
 
         offset_x = (label_size.width() - pixmap_size.width()) // 2
         offset_y = (label_size.height() - pixmap_size.height()) // 2
@@ -1692,26 +1810,51 @@ class ImageViewer(QMainWindow):
         max_allowed_zoom = max(1.0, fit_to_screen_zoom)
 
         if angle_delta > 0:
-            self.zoom_factor *= 1.15
+            new_zoom = self.zoom_factor * 1.15
         else:
-            self.zoom_factor /= 1.15
+            new_zoom = self.zoom_factor / 1.15
 
-        self.zoom_factor = max(0.05, min(max_allowed_zoom, self.zoom_factor))
+        new_zoom = max(0.05, min(max_allowed_zoom, new_zoom))
 
-        cursor_pos = event.position().toPoint()
+        # already at the zoom limit: nothing to re-render
+        if abs(new_zoom - self.zoom_factor) < 1e-9 and self.wheel_anchor is None:
+            return
+        self.zoom_factor = new_zoom
+
+        if self.wheel_anchor is None:
+            # remember what is under the cursor, in the coordinates of what is
+            # currently rendered; later steps in the same burst reuse this anchor
+            cursor_pos = event.position().toPoint()
+            h_bar = self.scroll_area.horizontalScrollBar()
+            v_bar = self.scroll_area.verticalScrollBar()
+            self.wheel_anchor = (
+                cursor_pos,
+                h_bar.value() + cursor_pos.x(),
+                v_bar.value() + cursor_pos.y(),
+                old_zoom,
+            )
+
+        self.smooth_zoom_timer.stop()
+        if not self.wheel_render_timer.isActive():
+            self.wheel_render_timer.start(16)
+
+    def apply_wheel_zoom(self):
+        anchor = self.wheel_anchor
+        self.wheel_anchor = None
+        if anchor is None or not self.is_custom_zoom or not self.base_image or self.base_image.isNull():
+            return
+        cursor_pos, content_x, content_y, rendered_zoom = anchor
+
         h_bar = self.scroll_area.horizontalScrollBar()
         v_bar = self.scroll_area.verticalScrollBar()
 
-        content_x = h_bar.value() + cursor_pos.x()
-        content_y = v_bar.value() + cursor_pos.y()
-
-        ratio = self.zoom_factor / old_zoom
+        ratio = self.zoom_factor / rendered_zoom
 
         self.update_image_display(smooth=False)
 
         h_bar.setValue(int(content_x * ratio - cursor_pos.x()))
         v_bar.setValue(int(content_y * ratio - cursor_pos.y()))
-        
+
         self.smooth_zoom_timer.start(150)
 
     def reset_to_fit_screen(self):
