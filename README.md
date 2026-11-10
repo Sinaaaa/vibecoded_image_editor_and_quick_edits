@@ -3,7 +3,7 @@ I tried pretty much all the well known image viewers on Linux & did not really l
 Also many of them are straight up laggy (hello there Gwenview, I don't like you). This applet feels snappy to use, it will always react to left-right arrow keys/spamming no matter how large the images you are browsing are, or at least it should.. Even the fastest computer needs time to load a 100mpx image from a spinning HDD, this vibe coded python monster handles this quite gracefully. Furthermore the app does caching, so if you open an image it will cache the next few in the background, so most of the time in typical use you will not notice any loading time or lag.
 
 
-![VibeCoded Image Viewer Screenshot](screenshot.jpg)
+![Screenshot](screenshot.jpg?v=2)
 # 🖼️ vibecoded_image_editor_and_quick_edits LLM Generated Usage Guide
 
 A lightweight, keyboard‑driven image viewer built with Python, PyQt6, and Pillow.  
