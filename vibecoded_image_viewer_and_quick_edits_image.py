@@ -46,10 +46,12 @@ SLIDESHOW_PRESETS_MS = [1000, 2000, 3000, 4000, 5500, 8000, 10000, 15000,
 
 HINT_DELAY_MS = 1000           # hover time before a button's description shows in the OSD
 
-# Sharpening (the "S" button / Shift+S), PIL's UnsharpMask
-SHARPEN_RADIUS = 3             # blur radius in px; larger = broader, coarser sharpening (try 0.5 - 5)
-SHARPEN_PERCENT = 30          # strength of the effect; 100 = mild, 150 = default, 300+ = harsh
-SHARPEN_THRESHOLD = 2          # min brightness difference (0-255) to sharpen; higher leaves smooth areas / noise alone
+# Sharpening (the "S" button / Shift+S): unsharp mask on LUMINANCE only (colour is left
+# untouched), optionally limited to edges.
+SHARPEN_RADIUS = 1.4             # blur radius in px; small = fine crisp detail (like Irfan/LR ~1.0), large = broad "texture" look (try 0.5 - 3)
+SHARPEN_PERCENT = 120            # strength; with small radii 80 - 200 is normal
+SHARPEN_THRESHOLD = 0            # min brightness difference (0-255) to sharpen
+SHARPEN_MASKING = 0             # 0 = sharpen everything; higher = only strong edges, flat areas / noise / skies untouched (like LR's Masking, 0 - 100)
 
 UI_FONT_SIZE = "16px"
 BTN_WIDTH = 36
@@ -182,6 +184,46 @@ class CacheWorker(QObject):
             pass
 
 
+def sharpen_luma(img, unsharp, masking):
+    """Unsharp-mask the luminance only, optionally restricted to edges.
+
+    Sharpening R, G and B separately also boosts colour noise and fringes, which
+    gives a crunchy, texture-like look. Working on Y (of YCbCr) keeps the colour
+    channels and alpha untouched. `masking` (0-100) fades the effect out in flat
+    areas, based on a slightly smoothed edge map of the luminance.
+    """
+    from PIL import Image, ImageFilter
+
+    bands = img.getbands()
+    alpha = img.getchannel("A") if "A" in bands else None
+    gray_only = bands in (("L",), ("L", "A"))
+    base = img.convert("L") if gray_only else img.convert("RGB")
+
+    if gray_only:
+        y = base
+    else:
+        y, cb, cr = base.convert("YCbCr").split()
+
+    y_sharp = y.filter(unsharp)
+
+    if masking > 0:
+        # pre-blur so pixel noise isn't mistaken for an edge, then threshold the edge map
+        lo = masking * 0.1
+        hi = lo + 12
+        lut = [min(255, max(0, int((v - lo) * 255 / (hi - lo)))) for v in range(256)]
+        mask = (y.filter(ImageFilter.GaussianBlur(0.8)).filter(ImageFilter.FIND_EDGES)
+                .point(lut).filter(ImageFilter.GaussianBlur(1.0)))
+        y_sharp = Image.composite(y_sharp, y, mask)
+
+    if gray_only:
+        out = y_sharp
+    else:
+        out = Image.merge("YCbCr", (y_sharp, cb, cr)).convert("RGB")
+    if alpha is not None:
+        out.putalpha(alpha)
+    return out
+
+
 class SharpenWorker(QObject):
     finished = pyqtSignal(int, QImage, object, str)
     progress = pyqtSignal(int, int)   # request_id, percent
@@ -201,17 +243,20 @@ class SharpenWorker(QObject):
             # pixels, which makes the stitched result match a one-shot sharpen.
             width, height = src.size
             unsharp = ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold)
-            margin = int(radius * 4) + 2
+            margin = max(int(radius * 4) + 2, 8)   # also covers the edge-mask kernels
+            masking = int(SHARPEN_MASKING)
             band_count = max(1, min(20, height // 64))
-            sharpened = Image.new(src.mode, src.size)
+            sharpened = None
 
             for i in range(band_count):
                 y0 = height * i // band_count
                 y1 = height * (i + 1) // band_count
                 top = max(0, y0 - margin)
                 bottom = min(height, y1 + margin)
-                band = src.crop((0, top, width, bottom)).filter(unsharp)
+                band = sharpen_luma(src.crop((0, top, width, bottom)), unsharp, masking)
                 band = band.crop((0, y0 - top, width, y0 - top + (y1 - y0)))
+                if sharpened is None:
+                    sharpened = Image.new(band.mode, src.size)
                 sharpened.paste(band, (0, y0))
                 # keep the last few % for the QImage conversion below
                 self.progress.emit(request_id, (i + 1) * 95 // band_count)
