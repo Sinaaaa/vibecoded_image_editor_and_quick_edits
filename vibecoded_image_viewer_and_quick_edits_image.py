@@ -1285,7 +1285,7 @@ class ImageViewer(QMainWindow):
                 font-size: {UI_FONT_SIZE};
             }}
             QWidget#controlsWrapper {{
-                background-color: {strip_color};
+                background-color: {bg_color};
             }}
             QWidget#controlsWidget {{
                 background-color: {strip_color};
@@ -1414,7 +1414,7 @@ class ImageViewer(QMainWindow):
         # the full stylesheet is applied in complete_startup once the buttons exist
         self.setStyleSheet(
             "QWidget { background-color: #000000; color: #e0e0e0; }"
-            "QWidget#controlsWrapper, QWidget#controlsWidget { background-color: #181818; }"
+            "QWidget#controlsWidget { background-color: #181818; }"
         )
 
     def eventFilter(self, source, event):
@@ -1724,7 +1724,7 @@ class ImageViewer(QMainWindow):
                 with Image.open(image_path) as img:
                     width, height = img.size
 
-            info_text = f"Resolution: {width} × {height} px  |  Size: {file_size_mb:.2f} MB"
+            info_text = f"{self.position_text()}\nResolution: {width} × {height} px  |  Size: {file_size_mb:.2f} MB"
             self.show_osd(info_text, duration=3000)
         except Exception as e:
             self.show_osd(f"Could not load image info:\n{str(e)}", duration=2000)
@@ -1924,11 +1924,15 @@ class ImageViewer(QMainWindow):
             
             self.trigger_worker()
 
+    def position_text(self):
+        """"7 / 81 - name.jpg": shown briefly when a picture is opened, and on top of the info."""
+        filename = os.path.basename(self.image_files[self.current_index])
+        return f"{self.current_index + 1} / {len(self.image_files)} - {filename}"
+
     def trigger_navigation(self):
         if self.current_index < 0 or self.current_index >= len(self.image_files):
             return
-        filename = os.path.basename(self.image_files[self.current_index])
-        self.show_osd(f"{self.current_index + 1} / {len(self.image_files)} - {filename}")
+        self.show_osd(self.position_text())
         
         self.zoom_factor = 1.0
         self.is_custom_zoom = False
