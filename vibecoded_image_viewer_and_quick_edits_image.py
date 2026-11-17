@@ -936,7 +936,7 @@ class ImageViewer(QMainWindow):
 
     def __init__(self, initial_path=None):
         super().__init__()
-        self.setWindowTitle("Image Viewer")
+        self.setWindowTitle("Vibe Images")
         self.resize(1100, 750)
 
         self.supported_extensions = None   # None: everything Pillow can open (supported_image_extensions)
@@ -2235,7 +2235,7 @@ class ImageViewer(QMainWindow):
             
             self.update_button_states()
 
-            self.setWindowTitle(f"Image Viewer - [Corrupted] {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
+            self.setWindowTitle(f"Vibe Images - [Corrupted] {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
         else:
             self.current_pil_image = pil_img
             self.base_image = qimage
@@ -2243,7 +2243,7 @@ class ImageViewer(QMainWindow):
                 # keep the pristine original: crop / sharpen / minify replace the picture on
                 # screen but never this entry, so Reset (Space) can show it again instantly
                 self.image_cache[image_path] = (qimage, pil_img)
-            self.setWindowTitle(f"Image Viewer - {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
+            self.setWindowTitle(f"Vibe Images - {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
             
             self.update_button_states()
             
@@ -2554,7 +2554,7 @@ class ImageViewer(QMainWindow):
                 self.image_label.clear()
                 self.image_label.setText("Open an image to start")
                 self.update_image_display()
-                self.setWindowTitle("Image Viewer")
+                self.setWindowTitle("Vibe Images")
                 self.update_button_states()
             else:
                 if self.current_index >= len(self.image_files):
