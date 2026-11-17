@@ -1,8 +1,11 @@
-#sudo pacman -S python python-pillow python-pyqt6 
+#sudo pacman -S python python-pillow python-pyqt6 glib2 python-pillow-heif python-pillow-jpegxl-plugin
 #NEED TO INSTALL THESE ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# (glib2 provides gio, used for the trash feature; the last two are optional: HEIC / HEIF and JPEG XL support,
+#  picked up automatically when installed)
 
 import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -235,6 +238,81 @@ def render_region_rgba(pil_img, box, out_w, out_h):
     return tile.tobytes("raw", "RGBA")
 
 
+_extensions = None
+
+
+def register_optional_plugins():
+    """HEIC / HEIF, JPEG XL and similar are not part of Pillow itself. If their (optional)
+    plugin packages are installed - pillow-heif, pillow-jxl-plugin - hook them in, so those
+    files open like any other. Without them nothing changes."""
+    from PIL import Image
+
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()      # .heic .heif .hif
+    except Exception:
+        pass
+    try:
+        import pillow_jxl  # noqa: F401   (registers JPEG XL, .jxl, when imported)
+    except Exception:
+        pass
+    if "AVIF" not in Image.OPEN:                # Pillow 11.3+ has AVIF built in
+        try:
+            import pillow_avif  # noqa: F401
+        except Exception:
+            pass
+
+
+def supported_image_extensions():
+    """Every file extension this Pillow can open, as a tuple of lower-case ".ext" strings.
+    Pillow's plugins register themselves on Image.init(), so whatever formats this install
+    supports (including optional ones) show up here automatically."""
+    global _extensions
+    if _extensions is None:
+        from PIL import Image
+
+        Image.init()
+        register_optional_plugins()
+        # formats that Pillow lists but can't show on their own
+        skip = {
+            "BUFR", "GRIB", "HDF5",   # stubs that need a handler supplied by the application
+            "MPEG",                   # video, not pictures
+        }
+        if sys.platform != "win32":
+            skip.add("WMF")           # Pillow renders WMF / EMF on Windows only
+        if not (shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")):
+            skip.add("EPS")           # EPS / PS need Ghostscript
+        found = {
+            ext.lower() for ext, fmt in Image.registered_extensions().items()
+            if fmt in Image.OPEN and fmt not in skip
+        }
+        found.add(".mpo")             # multi-picture JPEG: opened through the JPEG plugin
+        _extensions = tuple(sorted(found))
+    return _extensions
+
+
+def to_displayable(pil_img):
+    """16-bit / 32-bit integer and float images (16-bit TIFF / PNG, FITS, PFM ...) as 8-bit
+    grey. Pillow's own conversion just clips everything above 255, which turns them white."""
+    mode = pil_img.mode
+    try:
+        if mode == "I" or mode.startswith("I;16"):
+            hi = pil_img.getextrema()[1]
+            divisor = 1 if hi <= 255 else 16 if hi <= 4095 else 256 if hi <= 65535 else hi / 255.0
+            return pil_img.convert("I").point(lambda v: v * (1.0 / divisor)).convert("L")
+        if mode == "F":
+            lo, hi = pil_img.getextrema()
+            scale = 255.0 / (hi - lo) if hi > lo else 1.0
+            return pil_img.point(lambda v: (v - lo) * scale).convert("L")
+        if mode == "RGBa":
+            return pil_img.convert("RGBA")
+        if mode == "La":
+            return pil_img.convert("LA")
+    except Exception:
+        pass   # leave it as is; the usual conversion afterwards may still cope
+    return pil_img
+
+
 class MainImageWorker(QObject):
     finished = pyqtSignal(int, QImage, object, str)
     progress = pyqtSignal(int, int)   # request_id, percent
@@ -291,7 +369,7 @@ class MainImageWorker(QObject):
                 with Image.open(pf) as img:
                     pf.counting = True
                     img.load()
-                    pil_img = img.copy()
+                    pil_img = to_displayable(img.copy())
             emit(request_id, 65)
 
             if rotation_angle != 0:
@@ -345,7 +423,7 @@ class CacheWorker(QObject):
                         return
                     pf.counting = True
                     img.load()
-                    pil_img = img.copy()
+                    pil_img = to_displayable(img.copy())
 
             qimage = pil_to_qimage(pil_img)
 
@@ -462,6 +540,8 @@ class FolderScanWorker(QObject):
             self.finished.emit(request_id, [], -1, False)
             return
 
+        if not extensions:
+            extensions = supported_image_extensions()   # imports Pillow here, not on the GUI thread
         image_files = []
         for f in sorted(all_files):
             if f.lower().endswith(extensions):
@@ -859,11 +939,7 @@ class ImageViewer(QMainWindow):
         self.setWindowTitle("Image Viewer")
         self.resize(1100, 750)
 
-        self.supported_extensions = (
-            ".jpg", ".jpeg", ".png",
-            ".webp", ".bmp", ".gif",
-            ".tiff", ".tif", ".ico"
-        )
+        self.supported_extensions = None   # None: everything Pillow can open (supported_image_extensions)
         self.image_files = []
         self.current_index = -1
         
@@ -1790,7 +1866,7 @@ class ImageViewer(QMainWindow):
             self,
             "Open Image File",
             start_dir,
-            "Image Files (*.jpeg *.jpg *.png *.webp *.bmp *.gif *.tiff *.tif *.ico)"
+            "Image Files (" + " ".join("*" + ext for ext in supported_image_extensions()) + ")"
         )
         if file_path:
             self.load_from_path(file_path)
