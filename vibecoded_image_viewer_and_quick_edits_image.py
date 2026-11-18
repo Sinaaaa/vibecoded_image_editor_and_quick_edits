@@ -936,7 +936,7 @@ class ImageViewer(QMainWindow):
 
     def __init__(self, initial_path=None):
         super().__init__()
-        self.setWindowTitle("Vibe Images")
+        self.setWindowTitle("Image Viewer")
         self.resize(1100, 750)
 
         self.supported_extensions = None   # None: everything Pillow can open (supported_image_extensions)
@@ -966,6 +966,7 @@ class ImageViewer(QMainWindow):
         self.fit_token = 0   # bumped on every redraw; lets background smoothing drop stale results
         self.loading_image = False       # the current image is still being loaded / decoded
         self.pending_actions = deque()   # (function, label) queued while loading, run in order afterwards
+        self.zoom_queue_steps = []       # wheel turns collected in the queued "zoom" entry
         self.draining = False
         self.preview_image = None   # quick 1/8-size look at the image that is still loading
         self.preview_cache = {}     # path -> 1/8-size QImage, built ahead of time (see PREVIEW_CACHE_*)
@@ -2235,7 +2236,7 @@ class ImageViewer(QMainWindow):
             
             self.update_button_states()
 
-            self.setWindowTitle(f"Vibe Images - [Corrupted] {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
+            self.setWindowTitle(f"Image Viewer - [Corrupted] {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
         else:
             self.current_pil_image = pil_img
             self.base_image = qimage
@@ -2243,7 +2244,7 @@ class ImageViewer(QMainWindow):
                 # keep the pristine original: crop / sharpen / minify replace the picture on
                 # screen but never this entry, so Reset (Space) can show it again instantly
                 self.image_cache[image_path] = (qimage, pil_img)
-            self.setWindowTitle(f"Vibe Images - {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
+            self.setWindowTitle(f"Image Viewer - {os.path.basename(image_path)} ({self.current_index + 1}/{len(self.image_files)})")
             
             self.update_button_states()
             
@@ -2554,7 +2555,7 @@ class ImageViewer(QMainWindow):
                 self.image_label.clear()
                 self.image_label.setText("Open an image to start")
                 self.update_image_display()
-                self.setWindowTitle("Vibe Images")
+                self.setWindowTitle("Image Viewer")
                 self.update_button_states()
             else:
                 if self.current_index >= len(self.image_files):
@@ -2594,11 +2595,38 @@ class ImageViewer(QMainWindow):
             self.trigger_navigation()
 
     def handle_wheel_zoom(self, event):
-        if not self.base_image or self.base_image.isNull():
-            return
-
         angle_delta = event.angleDelta().y()
         if angle_delta == 0:
+            return
+        cursor_pos = event.position().toPoint()
+        if self.queue_zoom(angle_delta, cursor_pos):
+            return
+        self.zoom_at(angle_delta, cursor_pos)
+
+    def queue_zoom(self, angle_delta, cursor_pos):
+        """Wheel turns while the image is still loading: remember them (all turns together
+        form one queued "zoom" entry, in order with the other queued actions)."""
+        if self.draining or not (self.loading_image or self.pending_actions):
+            return False
+        step = (angle_delta, cursor_pos)
+        if self.pending_actions and self.pending_actions[-1][1] == "zoom":
+            self.zoom_queue_steps.append(step)
+        else:
+            steps = [step]
+            self.zoom_queue_steps = steps
+            self.defer_action(lambda: self.replay_zoom(steps), "zoom")
+        return True
+
+    def replay_zoom(self, steps):
+        for angle_delta, cursor_pos in steps:
+            self.zoom_at(angle_delta, cursor_pos)
+        # show the result before the next queued action looks at the display
+        if self.wheel_render_timer.isActive():
+            self.wheel_render_timer.stop()
+            self.apply_wheel_zoom()
+
+    def zoom_at(self, angle_delta, cursor_pos):
+        if not self.base_image or self.base_image.isNull():
             return
 
         old_zoom = self.zoom_factor
@@ -2633,7 +2661,6 @@ class ImageViewer(QMainWindow):
         if self.wheel_anchor is None:
             # remember what is under the cursor, in the coordinates of what is
             # currently rendered; later steps in the same burst reuse this anchor
-            cursor_pos = event.position().toPoint()
             h_bar = self.scroll_area.horizontalScrollBar()
             v_bar = self.scroll_area.verticalScrollBar()
             self.wheel_anchor = (
